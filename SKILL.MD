@@ -510,11 +510,8 @@ These chains are supported but have less mature SDK tooling. Use chain-specific 
 
 ### Simulate via CrossbarClient
 ```typescript
-import { CrossbarClient } from "@switchboard-xyz/common";
-
 const crossbar = new CrossbarClient("https://crossbar.switchboard.xyz");
 const result = await crossbar.simulateFeeds([feedHash]);
-console.log("Simulated value:", result);
 ```
 
 ### Job testing (local, no deployment needed)
@@ -583,24 +580,7 @@ Deployment means:
    const feedId = FeedHash.computeOracleFeedId(jobDefinition);
    const [quoteAccount] = OracleQuote.getCanonicalPubkey(queue.pubkey, [feedId.toString("hex")]);
    ```
-4) Fetch managed update instructions and include them in transactions
-   ```typescript
-   const sigVerifyIx = await queue.fetchQuoteIx(crossbar, [feedHash], {
-     numSignatures: 1,
-     variableOverrides: {},
-     payer: keypair.publicKey,
-   });
-
-   const tx = await sb.asV0Tx({
-     connection,
-     ixs: [sigVerifyIx, yourProgramIx],
-     signers: [keypair],
-     lookupTables: [lut],
-     computeUnitPrice: 75_000,
-     computeUnitLimitMultiple: 1.3,
-   });
-   await connection.sendTransaction(tx);
-   ```
+4) Fetch update instructions and include in same tx as your program ix (same `fetchQuoteIx` → `asV0Tx` pattern as Module 1 Solana read)
 
 Canonical account is created automatically on first use.
 
@@ -624,20 +604,7 @@ Treat deployment as:
 4) Submit updates via `updateFeeds` (pay fee from `getFee`)
 5) Read via `latestUpdate(feedId)` or `getFeedValue`
 
-```typescript
-import { ethers } from "ethers";
-import { CrossbarClient } from "@switchboard-xyz/common";
-
-const crossbar = new CrossbarClient("https://crossbar.switchboard.xyz");
-const { encoded } = await crossbar.fetchOracleQuote([feedHash], "mainnet");
-
-const switchboard = new ethers.Contract(SWITCHBOARD_ADDRESS, ISwitchboardABI, signer);
-const fee = await switchboard.getFee([encoded]);
-await switchboard.updateFeeds([encoded], { value: fee });
-
-const [value, timestamp, slotNumber] = await switchboard.latestUpdate(feedId);
-console.log(`Price: ${ethers.formatUnits(value, 18)}`);
-```
+Same `fetchOracleQuote` → `getFee` → `updateFeeds` → `latestUpdate` pattern as Module 1 EVM read.
 
 Notes:
 - Always compute and pay the required fee (`getFee`).
@@ -652,37 +619,16 @@ Notes:
   - read validation logic (max age, max deviation)
 
 ## Sui: Deploy with Quote Verifier pattern
+1) Create a `QuoteConsumer` on-chain (one-time setup):
 ```typescript
-import { SwitchboardClient, Quote } from "@switchboard-xyz/sui-sdk";
-
-const sb = new SwitchboardClient(suiClient);
-const state = await sb.fetchState();
-
-// Create a QuoteConsumer on-chain
 const createTx = new Transaction();
 createTx.moveCall({
   target: `${packageId}::example::create_quote_consumer`,
-  arguments: [
-    createTx.pure.id(state.oracleQueueId),
-    createTx.pure.u64(maxAgeMs),
-    createTx.pure.u64(maxDeviationBps),
-  ],
+  arguments: [createTx.pure.id(state.oracleQueueId), createTx.pure.u64(maxAgeMs), createTx.pure.u64(maxDeviationBps)],
 });
 await suiClient.signAndExecuteTransaction({ signer: keypair, transaction: createTx });
-
-// Fetch and verify quotes
-const updateTx = new Transaction();
-const quotes = await Quote.fetchUpdateQuote(sb, updateTx, {
-  feedHashes: [feedHash],
-  numOracles: 3,
-});
-
-updateTx.moveCall({
-  target: `${packageId}::example::update_price`,
-  arguments: [consumerObj, quotes, feedHashBytes, updateTx.object("0x6")],
-});
-await suiClient.signAndExecuteTransaction({ signer: keypair, transaction: updateTx });
 ```
+2) Fetch and verify quotes using the same `Quote.fetchUpdateQuote` → `moveCall` → sign pattern as Module 1 Sui read.
 
 ## Other chains
 If targeting Aptos, Iota, or Movement:
@@ -931,9 +877,10 @@ surge.on("unsignedPriceUpdate", (update: sb.UnsignedPriceUpdate) => {
 ## Solana/SVM randomness (commit/reveal)
 
 ### TypeScript client flow
+Each step builds a tx via `sb.asV0Tx({ connection, ixs, payer, signers, computeUnitPrice: 75_000, computeUnitLimitMultiple: 1.3 })` and sends it.
+
 ```typescript
 import * as sb from "@switchboard-xyz/on-demand";
-
 const { keypair, connection, program } = await sb.AnchorUtils.loadEnv();
 const queue = await setupQueue(program!);
 const sbProgram = await loadSbProgram(program!.provider);
@@ -941,46 +888,17 @@ const sbProgram = await loadSbProgram(program!.provider);
 // 1. Create randomness account (one-time)
 const rngKp = Keypair.generate();
 const [randomness, createIx] = await sb.Randomness.create(sbProgram, rngKp, queue);
-
-const createTx = await sb.asV0Tx({
-  connection,
-  ixs: [createIx],
-  payer: keypair.publicKey,
-  signers: [keypair, rngKp],
-  computeUnitPrice: 75_000,
-  computeUnitLimitMultiple: 1.3,
-});
-await connection.sendTransaction(createTx);
+// → build tx with ixs: [createIx], signers: [keypair, rngKp]
 
 // 2. Commit to randomness + your game action (same tx)
 const commitIx = await randomness.commitIx(queue);
 const gameActionIx = await createCoinFlipInstruction(myProgram, rngKp.publicKey, userGuess, ...);
+// → build tx with ixs: [commitIx, gameActionIx], signers: [keypair]
 
-const commitTx = await sb.asV0Tx({
-  connection,
-  ixs: [commitIx, gameActionIx],
-  payer: keypair.publicKey,
-  signers: [keypair],
-  computeUnitPrice: 75_000,
-  computeUnitLimitMultiple: 1.3,
-});
-await connection.sendTransaction(commitTx);
-
-// 3. Wait, then reveal randomness + settle game (same tx)
-await new Promise(resolve => setTimeout(resolve, 3000));
-
+// 3. Wait ~3s (oracle generates in TEE), then reveal + settle (same tx)
 const revealIx = await randomness.revealIx();
 const settleIx = await settleFlipInstruction(myProgram, ...);
-
-const revealTx = await sb.asV0Tx({
-  connection,
-  ixs: [revealIx, settleIx],
-  payer: keypair.publicKey,
-  signers: [keypair],
-  computeUnitPrice: 75_000,
-  computeUnitLimitMultiple: 1.3,
-});
-await connection.sendTransaction(revealTx);
+// → build tx with ixs: [revealIx, settleIx], signers: [keypair]
 ```
 
 ### Key patterns
@@ -998,13 +916,7 @@ await connection.sendTransaction(revealTx);
 
 ### TypeScript client flow
 ```typescript
-import { ethers } from "ethers";
-import { CrossbarClient } from "@switchboard-xyz/common";
-
-const provider = new ethers.JsonRpcProvider(rpcUrl);
-const wallet = new ethers.Wallet(privateKey, provider);
-const crossbar = new CrossbarClient("https://crossbar.switchboard.xyz");
-
+// Setup: ethers provider/wallet + CrossbarClient (same as Module 1 EVM)
 const contract = new ethers.Contract(CONTRACT_ADDRESS, contractABI, wallet);
 
 // 1. Request randomness (on-chain)
@@ -1312,13 +1224,4 @@ When producing artifacts, use these headings and keep them concise:
 - Sui Surge: https://docs.switchboard.xyz/docs-by-chain/sui/surge
 
 ### Code & API References
-- Examples repo: https://github.com/switchboard-xyz/sb-on-demand-examples
-- TypeDoc (on-demand): https://switchboard-docs.web.app/
-- TypeDoc (common): https://switchboardxyz-common.netlify.app/
-- Explorer: https://explorer.switchboard.xyz
-- GitHub org: https://github.com/switchboard-xyz
-- Discord: https://discord.gg/switchboard
-
-### External Specs
-- OpenAI skills: https://developers.openai.com/codex/skills/
-- AgentSkills spec: https://agentskills.io/home
+See "Developer Resources & Tools" table in the SDKs section above.
