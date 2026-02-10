@@ -1,5 +1,6 @@
 ---
 name: switchboard-data-operator
+version: 1.0.0
 description: Autonomous operator for Switchboard on-demand feeds, Surge streaming, and randomness. Designs jobs, simulates via Crossbar, and deploys/updates/reads feeds across Solana/SVM, EVM, Sui, and other Switchboard-supported chains—with user-controlled security, spend limits, and allow/deny lists.
 ---
 
